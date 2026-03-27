@@ -1,41 +1,178 @@
 /**
- * AutomergeProvider — browser-side WebSocket sync for Automerge + PartyKit.
+ * AutomergeProvider — browser-side Automerge sync via automerge-repo + PartyKit WebSocket.
  *
- * Connects to a PartyKit room running `withAutomerge(Server)`.
- * Runs the Automerge sync protocol over WebSocket.
- * Supports BroadcastChannel for cross-tab sync.
+ * Wraps automerge-repo's Repo with a PartyKit WebSocket NetworkAdapter.
+ * Handles BroadcastChannel for cross-tab sync, reconnect, and ephemeral messages.
  *
  * Usage:
  *   import { AutomergeProvider } from 'automerge-partyserver/provider';
- *   import { next as Automerge } from '@automerge/automerge';
  *
- *   let doc = Automerge.init();
  *   const provider = new AutomergeProvider({
  *     host: 'localhost:1999',
  *     room: 'my-model-id',
- *     doc,
- *     onUpdate: (newDoc) => { doc = newDoc; render(); },
  *   });
+ *
+ *   // Create or find a document
+ *   const handle = provider.repo.create();
+ *   handle.change((doc) => { doc.title = 'Hello'; });
+ *
+ *   // Or find an existing one
+ *   const handle = provider.repo.find(documentId);
+ *   handle.whenReady().then(() => { console.log(handle.doc()); });
  */
 
-import { next as Automerge, type Doc } from '@automerge/automerge';
+import {
+  Repo,
+  type PeerId,
+  type PeerMetadata,
+  type DocHandle,
+  type AnyDocumentId,
+  NetworkAdapter,
+  type NetworkAdapterInterface,
+  type Message,
+} from '@automerge/automerge-repo';
+import {
+  IndexedDBStorageAdapter,
+} from '@automerge/automerge-repo-storage-indexeddb';
+import {
+  BroadcastChannelNetworkAdapter,
+} from '@automerge/automerge-repo-network-broadcastchannel';
+import { encode as cborEncode, decode as cborDecode } from 'cborg';
 
-// Message types — must match server
-const MSG_SYNC = 0;
-const MSG_EPHEMERAL = 1;
+// ── Ephemeral message type ───────────────────────────────────────────────────
 
-function packMessage(type: number, payload: Uint8Array): Uint8Array {
-  const msg = new Uint8Array(1 + payload.length);
-  msg[0] = type;
-  msg.set(payload, 1);
-  return msg;
+const MSG_EPHEMERAL = 0x01;
+
+// ── PartyKit WebSocket NetworkAdapter ────────────────────────────────────────
+
+class PartyKitWebSocketAdapter extends NetworkAdapter {
+  private ws: WebSocket | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectDelay: number;
+  private readonly maxReconnectDelay: number;
+  private readonly url: string;
+  private destroyed = false;
+
+  constructor(
+    private readonly wsUrl: string,
+    private readonly onStatusChange?: (status: 'connecting' | 'connected' | 'disconnected') => void,
+    reconnectDelay = 2000,
+    maxReconnectDelay = 30000,
+  ) {
+    super();
+    this.url = wsUrl;
+    this.reconnectDelay = reconnectDelay;
+    this.maxReconnectDelay = maxReconnectDelay;
+  }
+
+  connect(peerId: PeerId, peerMetadata?: PeerMetadata): void {
+    this.peerId = peerId;
+    this.peerMetadata = peerMetadata;
+    this.openWebSocket();
+  }
+
+  disconnect(): void {
+    this.destroyed = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.ws) { this.ws.close(); this.ws = null; }
+  }
+
+  send(message: Message): void {
+    if (!this.ws || this.ws.readyState !== 1) return;
+    try {
+      this.ws.send(cborEncode(message));
+    } catch { /* ignore */ }
+  }
+
+  isReady(): boolean {
+    return this.ws?.readyState === 1;
+  }
+
+  whenReady(): Promise<void> {
+    if (this.isReady()) return Promise.resolve();
+    return new Promise((resolve) => {
+      const check = () => {
+        if (this.isReady()) resolve();
+        else setTimeout(check, 100);
+      };
+      check();
+    });
+  }
+
+  private openWebSocket(): void {
+    if (this.destroyed) return;
+    this.onStatusChange?.('connecting');
+
+    this.ws = new WebSocket(this.url);
+    this.ws.binaryType = 'arraybuffer';
+
+    this.ws.onopen = () => {
+      this.onStatusChange?.('connected');
+      this.reconnectDelay = 2000; // reset backoff
+
+      // Send join message
+      const joinMsg = {
+        type: 'join',
+        senderId: this.peerId,
+        peerMetadata: this.peerMetadata ?? {},
+        supportedProtocolVersions: ['1'],
+      };
+      this.ws!.send(cborEncode(joinMsg));
+    };
+
+    this.ws.onmessage = (event) => {
+      try {
+        const data = new Uint8Array(event.data as ArrayBuffer);
+
+        // Check for ephemeral
+        if (data.length > 0 && data[0] === MSG_EPHEMERAL) {
+          // Let the provider handle this (not automerge-repo)
+          this.emit('ephemeral' as any, data.subarray(1));
+          return;
+        }
+
+        const message = cborDecode(data);
+
+        // Handle peer announcement
+        if ((message as any).type === 'peer' && (message as any).senderId) {
+          this.emit('peer-candidate', {
+            peerId: (message as any).senderId as PeerId,
+            peerMetadata: (message as any).peerMetadata,
+          });
+          return;
+        }
+
+        // Regular sync message
+        this.emit('message', message);
+      } catch { /* malformed */ }
+    };
+
+    this.ws.onclose = () => {
+      this.onStatusChange?.('disconnected');
+      this.ws = null;
+      if (!this.destroyed) this.scheduleReconnect();
+    };
+  }
+
+  private scheduleReconnect(): void {
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openWebSocket();
+    }, this.reconnectDelay);
+    this.reconnectDelay = Math.min(this.reconnectDelay * 1.5, this.maxReconnectDelay);
+  }
+
+  /** Send raw ephemeral data (bypasses automerge-repo). */
+  sendEphemeral(data: Uint8Array): void {
+    if (!this.ws || this.ws.readyState !== 1) return;
+    const msg = new Uint8Array(1 + data.length);
+    msg[0] = MSG_EPHEMERAL;
+    msg.set(data, 1);
+    this.ws.send(msg);
+  }
 }
 
-function unpackMessage(data: Uint8Array): { type: number; payload: Uint8Array } {
-  return { type: data[0], payload: data.subarray(1) };
-}
-
-// ── Options ──────────────────────────────────────────────────────────────────
+// ── Provider options ─────────────────────────────────────────────────────────
 
 export interface AutomergeProviderOptions {
   /** PartyKit host (e.g. 'localhost:1999' or 'my-project.partykit.dev') */
@@ -44,184 +181,84 @@ export interface AutomergeProviderOptions {
   room: string;
   /** Party name (default: 'main') */
   party?: string;
-  /** Initial Automerge document */
-  doc: Doc<unknown>;
-  /** Called when the document is updated by a remote peer */
-  onUpdate: (doc: Doc<unknown>) => void;
-  /** Called when an ephemeral message (presence) is received */
-  onEphemeral?: (data: Uint8Array) => void;
   /** Called when connection state changes */
   onStatus?: (status: 'connecting' | 'connected' | 'disconnected') => void;
-  /** Reconnect delay in ms (default: 2000) */
-  reconnectDelay?: number;
-  /** Max reconnect delay in ms (default: 30000) */
-  maxReconnectDelay?: number;
+  /** Called when ephemeral data arrives (presence, cursor) */
+  onEphemeral?: (data: Uint8Array) => void;
+  /** Use IndexedDB for local persistence (default: true) */
+  indexedDB?: boolean;
+  /** IDB database name (default: 'automerge-partyserver') */
+  idbName?: string;
   /** Use BroadcastChannel for cross-tab sync (default: true) */
   broadcast?: boolean;
-  /** WebSocket protocol ('ws' or 'wss', default: auto-detect from host) */
+  /** WebSocket protocol ('ws' or 'wss', default: auto-detect) */
   protocol?: 'ws' | 'wss';
 }
 
 // ── Provider ─────────────────────────────────────────────────────────────────
 
 export class AutomergeProvider {
-  private ws: WebSocket | null = null;
-  private syncState: Automerge.SyncState = Automerge.initSyncState();
-  private doc: Doc<unknown>;
-  private bc: BroadcastChannel | null = null;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private reconnectDelay: number;
-  private readonly maxReconnectDelay: number;
-  private readonly url: string;
-  private readonly opts: AutomergeProviderOptions;
-  private destroyed = false;
+  readonly repo: Repo;
+  private wsAdapter: PartyKitWebSocketAdapter;
 
   constructor(opts: AutomergeProviderOptions) {
-    this.opts = opts;
-    this.doc = opts.doc;
-    this.reconnectDelay = opts.reconnectDelay ?? 2000;
-    this.maxReconnectDelay = opts.maxReconnectDelay ?? 30000;
-
     const protocol = opts.protocol ?? (opts.host.startsWith('localhost') ? 'ws' : 'wss');
     const party = opts.party ?? 'main';
     const host = opts.host.replace(/^https?:\/\//, '');
-    this.url = `${protocol}://${host}/parties/${party}/${opts.room}`;
+    const url = `${protocol}://${host}/parties/${party}/${opts.room}`;
+
+    // Network adapters
+    this.wsAdapter = new PartyKitWebSocketAdapter(url, opts.onStatus);
+    const networkAdapters: NetworkAdapterInterface[] = [
+      this.wsAdapter as unknown as NetworkAdapterInterface,
+    ];
 
     // BroadcastChannel for cross-tab sync
     if (opts.broadcast !== false && typeof BroadcastChannel !== 'undefined') {
-      this.bc = new BroadcastChannel(`automerge:${opts.room}`);
-      this.bc.onmessage = (event) => {
-        const bytes = new Uint8Array(event.data);
-        this.doc = Automerge.merge(this.doc, Automerge.load(bytes));
-        this.opts.onUpdate(this.doc);
-      };
+      networkAdapters.push(
+        new BroadcastChannelNetworkAdapter() as unknown as NetworkAdapterInterface,
+      );
     }
 
-    this.connect();
-  }
+    // Storage
+    const useIdb = opts.indexedDB !== false && typeof indexedDB !== 'undefined';
 
-  // ── Connection ───────────────────────────────────────────────────────
+    // Create Repo
+    this.repo = new Repo({
+      network: networkAdapters,
+      storage: useIdb ? new IndexedDBStorageAdapter(opts.idbName ?? 'automerge-partyserver') : undefined,
+      peerId: `client:${crypto.randomUUID()}` as PeerId,
+    });
 
-  private connect(): void {
-    if (this.destroyed) return;
-    this.opts.onStatus?.('connecting');
-
-    this.ws = new WebSocket(this.url);
-    this.ws.binaryType = 'arraybuffer';
-
-    this.ws.onopen = () => {
-      this.opts.onStatus?.('connected');
-      this.reconnectDelay = this.opts.reconnectDelay ?? 2000; // reset backoff
-      // Server sends sync step 1 on connect — we respond in onmessage
-    };
-
-    this.ws.onmessage = (event) => {
-      const data = new Uint8Array(event.data as ArrayBuffer);
-      const { type, payload } = unpackMessage(data);
-
-      switch (type) {
-        case MSG_SYNC:
-          this.handleSync(payload);
-          break;
-        case MSG_EPHEMERAL:
-          this.opts.onEphemeral?.(payload);
-          break;
-      }
-    };
-
-    this.ws.onclose = () => {
-      this.opts.onStatus?.('disconnected');
-      this.ws = null;
-      this.scheduleReconnect();
-    };
-
-    this.ws.onerror = () => {
-      // onclose will fire after onerror
-    };
-  }
-
-  private scheduleReconnect(): void {
-    if (this.destroyed) return;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
-    }, this.reconnectDelay);
-    // Exponential backoff
-    this.reconnectDelay = Math.min(this.reconnectDelay * 1.5, this.maxReconnectDelay);
-  }
-
-  // ── Sync protocol ───────────────────────────────────────────────────
-
-  private handleSync(syncMessage: Uint8Array): void {
-    // Receive server's sync message
-    const [newDoc, newSyncState] = Automerge.receiveSyncMessage(
-      this.doc,
-      this.syncState,
-      syncMessage,
-    );
-    this.doc = newDoc;
-    this.syncState = newSyncState;
-
-    // Notify consumer
-    this.opts.onUpdate(this.doc);
-
-    // Generate response
-    const [nextSyncState, reply] = Automerge.generateSyncMessage(
-      this.doc,
-      this.syncState,
-    );
-    this.syncState = nextSyncState;
-
-    if (reply && this.ws?.readyState === 1) {
-      this.ws.send(packMessage(MSG_SYNC, reply));
+    // Wire ephemeral events
+    if (opts.onEphemeral) {
+      this.wsAdapter.on('ephemeral' as any, opts.onEphemeral);
     }
   }
 
-  // ── Public API ──────────────────────────────────────────────────────
-
-  /** Apply a local change and sync with server + other tabs. */
-  change(changeFn: (doc: Doc<unknown>) => void): void {
-    this.doc = Automerge.change(this.doc, changeFn);
-    this.opts.onUpdate(this.doc);
-
-    // Sync with server
-    const [nextSyncState, syncMessage] = Automerge.generateSyncMessage(
-      this.doc,
-      this.syncState,
-    );
-    this.syncState = nextSyncState;
-    if (syncMessage && this.ws?.readyState === 1) {
-      this.ws.send(packMessage(MSG_SYNC, syncMessage));
-    }
-
-    // Broadcast to other tabs
-    if (this.bc) {
-      this.bc.postMessage(Automerge.save(this.doc));
-    }
+  /** Create a new document. Returns a DocHandle. */
+  create<T>(): DocHandle<T> {
+    return this.repo.create<T>();
   }
 
-  /** Send an ephemeral message (presence, cursor position, etc). */
+  /** Find an existing document by ID. Returns a DocHandle. */
+  find<T>(docId: AnyDocumentId): DocHandle<T> {
+    return this.repo.find<T>(docId);
+  }
+
+  /** Send ephemeral data (presence, cursor) — not persisted. */
   sendEphemeral(data: Uint8Array): void {
-    if (this.ws?.readyState === 1) {
-      this.ws.send(packMessage(MSG_EPHEMERAL, data));
-    }
+    this.wsAdapter.sendEphemeral(data);
   }
 
-  /** Get the current document. */
-  getDoc(): Doc<unknown> {
-    return this.doc;
-  }
-
-  /** Clean up — close WebSocket, BroadcastChannel, timers. */
-  destroy(): void {
-    this.destroyed = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    if (this.ws) { this.ws.close(); this.ws = null; }
-    if (this.bc) { this.bc.close(); this.bc = null; }
-  }
-
-  /** Is the WebSocket currently connected? */
+  /** Is the WebSocket connected? */
   get connected(): boolean {
-    return this.ws?.readyState === 1;
+    return this.wsAdapter.isReady();
+  }
+
+  /** Destroy — close WebSocket, cleanup. */
+  destroy(): void {
+    this.wsAdapter.disconnect();
+    // Repo doesn't have a destroy method, but network disconnect is sufficient
   }
 }

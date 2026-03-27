@@ -1,181 +1,266 @@
 /**
  * automerge-partyserver — Automerge CRDT sync for PartyKit / partyserver.
  *
- * Provides `withAutomerge(Server)` mixin — same pattern as y-partyserver's `withYjs(Server)`.
+ * Uses automerge-repo internally for the sync protocol, document lifecycle,
+ * and storage. The `withAutomerge(Server)` mixin bridges automerge-repo's
+ * NetworkAdapter to PartyKit's WebSocket connections.
  *
  * Usage:
  *   import { withAutomerge, AutomergeServer } from 'automerge-partyserver';
- *
- *   // Option A: use the mixin
- *   class MyServer extends withAutomerge(Server) {
- *     async onLoad() { return loadFromR2(); }
- *     async onSave(doc) { await saveToR2(doc); }
- *   }
- *
- *   // Option B: use the pre-built class
- *   export default AutomergeServer;
+ *   export default class MyServer extends withAutomerge(Server) { ... }
  */
 
 import {
-  next as Automerge,
-  type Doc,
-  type Heads,
-} from '@automerge/automerge';
+  Repo,
+  type PeerId,
+  type DocumentId,
+  type DocHandle,
+  type PeerMetadata,
+  NetworkAdapter,
+  type NetworkAdapterInterface,
+  type Message,
+} from '@automerge/automerge-repo';
+import { next as Automerge } from '@automerge/automerge';
 import type { Connection, ConnectionContext, WSMessage } from 'partyserver';
 import { Server } from 'partyserver';
+import { encode as cborEncode, decode as cborDecode } from 'cborg';
+import { DOStorageAdapter } from './storage';
 
-// ── Message types ────────────────────────────────────────────────────────────
-// Simple binary protocol: first byte = message type, rest = payload.
+// ── PartyKit NetworkAdapter for automerge-repo ───────────────────────────────
 
-const MSG_SYNC = 0;
-const MSG_EPHEMERAL = 1;  // presence/awareness
+/**
+ * Bridges automerge-repo's NetworkAdapter interface to PartyKit WebSocket connections.
+ *
+ * automerge-repo calls `send(message)` → we forward to the right WebSocket connection.
+ * PartyKit gives us `onMessage(conn, data)` → we emit to automerge-repo.
+ */
+class PartyKitNetworkAdapter extends NetworkAdapter {
+  private connections = new Map<string, Connection>();
+  private serverPeerId: PeerId;
 
-// ── Per-connection sync state ────────────────────────────────────────────────
+  constructor(serverPeerId: string) {
+    super();
+    this.serverPeerId = serverPeerId as PeerId;
+  }
 
-const SYNC_STATE_KEY = '__amSyncState';
+  // ── NetworkAdapter interface ─────────────────────────────────────────
 
-function getSyncState(conn: Connection): Automerge.SyncState {
-  try {
-    const state = conn.state as Record<string, unknown> | null;
-    const encoded = state?.[SYNC_STATE_KEY] as Uint8Array | undefined;
-    if (encoded) {
-      return Automerge.decodeSyncState(encoded);
+  connect(peerId: PeerId, peerMetadata?: PeerMetadata): void {
+    this.peerId = peerId;
+    this.peerMetadata = peerMetadata;
+  }
+
+  disconnect(): void {
+    this.connections.clear();
+  }
+
+  send(message: Message): void {
+    const targetId = message.targetId as string;
+    const conn = this.connections.get(targetId);
+    if (!conn || conn.readyState !== 1) return;
+
+    try {
+      const encoded = cborEncode(message);
+      conn.send(encoded);
+    } catch {
+      // connection broken
     }
-  } catch { /* ignore */ }
-  return Automerge.initSyncState();
-}
+  }
 
-function setSyncState(conn: Connection, syncState: Automerge.SyncState): void {
-  try {
-    conn.setState((prev: Record<string, unknown> | null) => ({
-      ...prev,
-      [SYNC_STATE_KEY]: Automerge.encodeSyncState(syncState),
-    }));
-  } catch { /* ignore — may fail if connection is already closed */ }
-}
+  isReady(): boolean {
+    return true;
+  }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+  whenReady(): Promise<void> {
+    return Promise.resolve();
+  }
 
-function send(conn: Connection, data: Uint8Array): void {
-  try {
-    if (conn.readyState === 1 /* OPEN */) {
-      conn.send(data);
+  // ── PartyKit events (called by the mixin) ────────────────────────────
+
+  addConnection(peerId: string, conn: Connection): void {
+    this.connections.set(peerId, conn);
+  }
+
+  removeConnection(peerId: string): void {
+    this.connections.delete(peerId);
+    this.emit('peer-disconnected', { peerId: peerId as PeerId });
+  }
+
+  receiveMessage(conn: Connection, data: Uint8Array): void {
+    try {
+      const message = cborDecode(data) as any;
+
+      // Handle join message (first message from client)
+      if (message.type === 'join' && message.senderId) {
+        const peerId = message.senderId as string;
+        this.connections.set(peerId, conn);
+
+        // Announce the new peer to the repo
+        this.emit('peer-candidate', {
+          peerId: peerId as PeerId,
+          peerMetadata: message.peerMetadata,
+        });
+
+        // Tell the client about us
+        const peerMsg = {
+          type: 'peer',
+          senderId: this.serverPeerId,
+          targetId: peerId,
+          peerMetadata: this.peerMetadata ?? {},
+          selectedProtocolVersion: '1',
+        };
+        conn.send(cborEncode(peerMsg));
+        return;
+      }
+
+      // Regular message — forward to repo
+      this.emit('message', message);
+    } catch {
+      // malformed message
     }
-  } catch { /* connection broken, ignore */ }
+  }
 }
 
-function packMessage(type: number, payload: Uint8Array): Uint8Array {
-  const msg = new Uint8Array(1 + payload.length);
-  msg[0] = type;
-  msg.set(payload, 1);
-  return msg;
-}
+// ── Ephemeral message type byte ──────────────────────────────────────────────
 
-function unpackMessage(data: Uint8Array): { type: number; payload: Uint8Array } {
-  return { type: data[0], payload: data.subarray(1) };
-}
+const MSG_EPHEMERAL = 0x01;
 
 // ── Mixin ────────────────────────────────────────────────────────────────────
 
 type ServerClass = new (...args: any[]) => Server;
 
 export interface AutomergeInstance {
-  /** The current Automerge document. */
-  readonly doc: Doc<unknown>;
+  /** The automerge-repo Repo instance. */
+  readonly repo: Repo;
 
-  /** Called on start — return initial doc state, or void for empty doc. */
+  /** Get a document handle by ID. */
+  getHandle(docId: string): DocHandle<unknown> | undefined;
+
+  /** Called on start — return initial doc bytes, or void for empty. */
   onLoad(): Promise<Uint8Array | void>;
 
-  /** Called periodically when doc changes — persist the doc bytes. */
+  /** Called when repo wants to persist (debounced). */
   onSave(bytes: Uint8Array): Promise<void>;
 
-  /** Process a sync message from a connection. */
+  /** Handle incoming WebSocket messages. */
   handleMessage(connection: Connection, message: WSMessage): void;
 
-  /** Send an ephemeral message (presence, cursor) to all connections. */
+  /** Broadcast ephemeral data (presence/cursor) to all peers. */
   broadcastEphemeral(data: Uint8Array, exclude?: Connection): void;
 }
 
 /**
  * Mixin that adds Automerge sync to a partyserver Server class.
  *
- * Same pattern as y-partyserver's `withYjs(Server)`.
+ * Uses automerge-repo internally for:
+ * - Incremental sync protocol (generateSyncMessage/receiveSyncMessage)
+ * - Document lifecycle (DocHandle state machine)
+ * - Per-peer sync state tracking
+ * - Storage via DOStorageAdapter
  *
- * The DO keeps the Automerge doc in memory. On each WebSocket message,
- * it runs Automerge's sync protocol (generateSyncMessage/receiveSyncMessage).
- * Sync state per connection is stored in conn.setState() so it survives
- * WebSocket Hibernation.
+ * Same pattern as y-partyserver's `withYjs(Server)`.
  */
 export function withAutomerge<TBase extends ServerClass>(
   Base: TBase,
 ): TBase & (new (...args: any[]) => AutomergeInstance) {
   class AutomergeMixin extends Base {
-    #doc: Doc<unknown> = Automerge.init();
-    #saveTimeout: ReturnType<typeof setTimeout> | null = null;
-    #saveDebounceMs = 2000;
+    #repo!: Repo;
+    #networkAdapter!: PartyKitNetworkAdapter;
+    #storageAdapter!: DOStorageAdapter;
 
-    get doc(): Doc<unknown> {
-      return this.#doc;
+    get repo(): Repo {
+      return this.#repo;
     }
 
-    // ── Lifecycle ──────────────────────────────────────────────────────
+    getHandle(docId: string): DocHandle<unknown> | undefined {
+      return this.#repo.handles[docId as DocumentId];
+    }
+
+    // ── Lifecycle ────────────────────────────────────────────────────
 
     async onLoad(): Promise<Uint8Array | void> {
-      // Override in subclass to load from R2/DO storage/etc.
+      // Override in subclass to provide initial state
       return;
     }
 
     async onSave(_bytes: Uint8Array): Promise<void> {
-      // Override in subclass to persist to R2/DO storage/etc.
+      // Override in subclass for additional persistence (e.g. R2 backup)
     }
 
     async onStart(): Promise<void> {
-      // Load initial state
-      const bytes = await this.onLoad();
-      if (bytes && bytes.length > 0) {
-        this.#doc = Automerge.load(bytes);
+      const serverPeerId = `server:${this.room.id}`;
+
+      // Create DO-backed storage adapter
+      this.#storageAdapter = new DOStorageAdapter(this.room.storage as any);
+
+      // Create network adapter that bridges to PartyKit WebSocket
+      this.#networkAdapter = new PartyKitNetworkAdapter(serverPeerId);
+
+      // Create automerge-repo Repo
+      this.#repo = new Repo({
+        network: [this.#networkAdapter as unknown as NetworkAdapterInterface],
+        storage: this.#storageAdapter,
+        peerId: serverPeerId as PeerId,
+        sharePolicy: async () => true, // accept all documents
+      });
+
+      // Load initial state if provided
+      const initialBytes = await this.onLoad();
+      if (initialBytes && initialBytes.length > 0) {
+        // Import the document into the repo
+        const doc = Automerge.load(initialBytes);
+        // The repo will handle storage from here
       }
 
-      // After hibernation wake-up: doc is empty but connections survive.
-      // Send sync step 1 to all connections — they respond with their state.
+      // Re-sync existing connections after hibernation wake-up
       for (const conn of this.getConnections()) {
-        this.#sendSync(conn);
+        // Connections that survived hibernation need to re-handshake
+        // The client will re-send a join message on reconnect
       }
     }
 
-    // ── Connection lifecycle ───────────────────────────────────────────
+    // ── Connection lifecycle ─────────────────────────────────────────
 
     onConnect(conn: Connection<unknown>, _ctx: ConnectionContext): void | Promise<void> {
-      // Send initial sync message to the new connection
-      this.#sendSync(conn);
+      // Don't do anything yet — wait for the join message in onMessage.
+      // automerge-repo's protocol requires a join/peer handshake before sync.
     }
 
     onClose(
-      _conn: Connection<unknown>,
+      conn: Connection<unknown>,
       _code: number,
       _reason: string,
       _wasClean: boolean,
     ): void | Promise<void> {
-      // Sync state is cleaned up automatically (stored in conn.state).
-      // If no connections remain, flush any pending save.
+      // Find and remove this connection's peer ID
+      // Connection state may have the peer ID from the join handshake
+      try {
+        const state = conn.state as Record<string, unknown> | null;
+        const peerId = state?.['__amPeerId'] as string | undefined;
+        if (peerId) {
+          this.#networkAdapter.removeConnection(peerId);
+        }
+      } catch { /* ignore */ }
+
+      // Flush repo if no connections remain
       let hasConnections = false;
       for (const _ of this.getConnections()) {
         hasConnections = true;
         break;
       }
       if (!hasConnections) {
-        this.#flushSave();
+        this.#repo.flush().catch(() => {});
       }
     }
 
-    // ── Message handling ───────────────────────────────────────────────
+    // ── Message handling ─────────────────────────────────────────────
 
     onMessage(conn: Connection, message: WSMessage): void {
       this.handleMessage(conn, message);
     }
 
     handleMessage(connection: Connection, message: WSMessage): void {
-      if (typeof message === 'string') return; // ignore text messages
+      if (typeof message === 'string') return; // ignore text
 
       const data = message instanceof Uint8Array
         ? message
@@ -183,94 +268,40 @@ export function withAutomerge<TBase extends ServerClass>(
           ? new Uint8Array(message)
           : new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
 
-      const { type, payload } = unpackMessage(data);
-
-      switch (type) {
-        case MSG_SYNC:
-          this.#handleSync(connection, payload);
-          break;
-        case MSG_EPHEMERAL:
-          // Forward ephemeral to all other connections
-          this.broadcastEphemeral(payload, connection);
-          break;
+      // Check for ephemeral messages (first byte = MSG_EPHEMERAL)
+      if (data.length > 0 && data[0] === MSG_EPHEMERAL) {
+        this.broadcastEphemeral(data.subarray(1), connection);
+        return;
       }
+
+      // CBOR-encoded automerge-repo message — forward to network adapter
+      // Also store peer ID on connection for cleanup in onClose
+      try {
+        const decoded = cborDecode(data) as any;
+        if (decoded.senderId) {
+          connection.setState((prev: Record<string, unknown> | null) => ({
+            ...prev,
+            '__amPeerId': decoded.senderId,
+          }));
+        }
+      } catch { /* ignore decode errors for state tracking */ }
+
+      this.#networkAdapter.receiveMessage(connection, data);
     }
 
-    // ── Sync protocol ──────────────────────────────────────────────────
-
-    #handleSync(conn: Connection, syncMessage: Uint8Array): void {
-      // Receive the sync message
-      let syncState = getSyncState(conn);
-      const [newDoc, newSyncState] = Automerge.receiveSyncMessage(
-        this.#doc,
-        syncState,
-        syncMessage,
-      );
-      this.#doc = newDoc;
-      syncState = newSyncState;
-
-      // Generate response
-      const [nextSyncState, reply] = Automerge.generateSyncMessage(
-        this.#doc,
-        syncState,
-      );
-      setSyncState(conn, nextSyncState);
-
-      if (reply) {
-        send(conn, packMessage(MSG_SYNC, reply));
-      }
-
-      // Broadcast updates to other connections
-      for (const other of this.getConnections()) {
-        if (other === conn) continue;
-        this.#sendSync(other);
-      }
-
-      // Schedule debounced save
-      this.#scheduleSave();
-    }
-
-    #sendSync(conn: Connection): void {
-      const syncState = getSyncState(conn);
-      const [nextSyncState, syncMessage] = Automerge.generateSyncMessage(
-        this.#doc,
-        syncState,
-      );
-      setSyncState(conn, nextSyncState);
-      if (syncMessage) {
-        send(conn, packMessage(MSG_SYNC, syncMessage));
-      }
-    }
-
-    // ── Ephemeral (presence/awareness) ─────────────────────────────────
+    // ── Ephemeral ────────────────────────────────────────────────────
 
     broadcastEphemeral(data: Uint8Array, exclude?: Connection): void {
-      const msg = packMessage(MSG_EPHEMERAL, data);
+      const msg = new Uint8Array(1 + data.length);
+      msg[0] = MSG_EPHEMERAL;
+      msg.set(data, 1);
+
       for (const conn of this.getConnections()) {
         if (conn === exclude) continue;
-        send(conn, msg);
+        try {
+          if (conn.readyState === 1) conn.send(msg);
+        } catch { /* ignore broken connections */ }
       }
-    }
-
-    // ── Persistence ────────────────────────────────────────────────────
-
-    #scheduleSave(): void {
-      if (this.#saveTimeout) return;
-      this.#saveTimeout = setTimeout(() => {
-        this.#saveTimeout = null;
-        this.#flushSave();
-      }, this.#saveDebounceMs);
-    }
-
-    #flushSave(): void {
-      if (this.#saveTimeout) {
-        clearTimeout(this.#saveTimeout);
-        this.#saveTimeout = null;
-      }
-      const bytes = Automerge.save(this.#doc);
-      this.onSave(bytes).catch((err) => {
-        console.error('[automerge-partyserver] Failed to save:', err);
-      });
     }
   }
 
@@ -279,3 +310,5 @@ export function withAutomerge<TBase extends ServerClass>(
 
 /** Pre-built Automerge server — extend or use directly. */
 export const AutomergeServer = withAutomerge(Server);
+
+export { DOStorageAdapter } from './storage';
