@@ -12,6 +12,7 @@ await build({
   dts: true,
   skipNodeModulesBundle: true,
   fixedExtension: false,
+  hash: false,
 });
 
 process.exit(0);

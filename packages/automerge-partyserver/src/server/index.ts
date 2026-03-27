@@ -166,8 +166,9 @@ export function withAutomerge<TBase extends ServerClass>(
   Base: TBase,
 ): TBase & (new (...args: any[]) => AutomergeInstance) {
   class AutomergeMixin extends Base {
-    // These exist on Server but TS can't see them through the mixin
-    declare room: { id: string; storage: any };
+    // These exist on Server (extends DurableObject) but TS can't see them through the mixin
+    declare name: string;
+    declare ctx: { storage: any };
     declare getConnections: () => Iterable<Connection>;
 
     #repo!: Repo;
@@ -194,10 +195,10 @@ export function withAutomerge<TBase extends ServerClass>(
     }
 
     async onStart(): Promise<void> {
-      const serverPeerId = `server:${this.room.id}`;
+      const serverPeerId = `server:${this.name}`;
 
       // Create DO-backed storage adapter
-      this.#storageAdapter = new DOStorageAdapter(this.room.storage as any);
+      this.#storageAdapter = new DOStorageAdapter(this.ctx.storage as any);
 
       // Create network adapter that bridges to PartyKit WebSocket
       this.#networkAdapter = new PartyKitNetworkAdapter(serverPeerId);
