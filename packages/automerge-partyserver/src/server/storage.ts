@@ -49,7 +49,7 @@ export class DOStorageAdapter implements StorageAdapterInterface {
     const direct = await this.storage.get<Uint8Array>(prefix);
     if (direct) {
       if (direct instanceof Uint8Array) return direct;
-      if (direct instanceof ArrayBuffer) return new Uint8Array(direct);
+      if ((direct as any) instanceof ArrayBuffer) return new Uint8Array(direct as ArrayBuffer);
       // DO storage may deserialize as a plain object with numeric keys
       if (typeof direct === 'object' && direct !== null) {
         return new Uint8Array(Object.values(direct as Record<string, number>));

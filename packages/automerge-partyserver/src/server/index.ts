@@ -21,7 +21,9 @@ import {
   type Message,
 } from '@automerge/automerge-repo';
 import { next as Automerge } from '@automerge/automerge';
+// @ts-expect-error — partyserver types resolve at build time via workspace
 import type { Connection, ConnectionContext, WSMessage } from 'partyserver';
+// @ts-expect-error — partyserver types resolve at build time via workspace
 import { Server } from 'partyserver';
 import { encode as cborEncode, decode as cborDecode } from 'cborg';
 import { DOStorageAdapter } from './storage';
@@ -164,6 +166,10 @@ export function withAutomerge<TBase extends ServerClass>(
   Base: TBase,
 ): TBase & (new (...args: any[]) => AutomergeInstance) {
   class AutomergeMixin extends Base {
+    // These exist on Server but TS can't see them through the mixin
+    declare room: { id: string; storage: any };
+    declare getConnections: () => Iterable<Connection>;
+
     #repo!: Repo;
     #networkAdapter!: PartyKitNetworkAdapter;
     #storageAdapter!: DOStorageAdapter;

@@ -243,7 +243,7 @@ export class AutomergeProvider {
 
   /** Find an existing document by ID. Returns a DocHandle. */
   find<T>(docId: AnyDocumentId): DocHandle<T> {
-    return this.repo.find<T>(docId);
+    return this.repo.find<T>(docId) as unknown as DocHandle<T>;
   }
 
   /** Send ephemeral data (presence, cursor) — not persisted. */

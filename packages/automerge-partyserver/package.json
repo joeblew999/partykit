@@ -29,21 +29,25 @@
       "import": "./dist/provider/index.js"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsx scripts/build.ts"
   },
   "dependencies": {
     "@automerge/automerge": "^3.0.0",
     "@automerge/automerge-repo": "^2.2.0",
-    "@automerge/automerge-repo-storage-indexeddb": "^2.2.0",
     "@automerge/automerge-repo-network-broadcastchannel": "^2.2.0",
+    "@automerge/automerge-repo-storage-indexeddb": "^2.2.0",
+    "@types/node": "^25.5.0",
     "cborg": "^4.0.0",
-    "partyserver": "workspace:*"
+    "partyserver": "^0.4.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250813.0",
-    "partysocket": "workspace:*",
+    "partysocket": "^1.1.16",
     "tsdown": "^0.12.0",
     "tsx": "^4.0.0",
     "typescript": "^5.7.0"

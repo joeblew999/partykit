@@ -1,42 +1,25 @@
 /**
- * Example: Browser client that syncs an Automerge doc via PartyKit.
- *
- * Usage:
- *   import { setup } from './client';
- *   const { provider, getDoc } = setup('my-model-id');
- *   provider.change((doc) => { doc.items.push({ text: 'hello' }); });
+ * Example: Browser client that syncs Automerge docs via PartyKit.
  */
 
-import { next as Automerge } from '@automerge/automerge';
 import { AutomergeProvider } from '../src/provider/index';
 
 export function setup(room: string, host = 'localhost:1999') {
-  let doc = Automerge.init<{ items: Array<{ text: string }> }>();
-
   const provider = new AutomergeProvider({
     host,
     room,
-    doc,
-    onUpdate: (newDoc) => {
-      doc = newDoc as typeof doc;
-      console.log('[client] Doc updated:', Automerge.toJS(doc));
-    },
-    onEphemeral: (data) => {
-      console.log('[client] Ephemeral:', new TextDecoder().decode(data));
-    },
-    onStatus: (status) => {
-      console.log('[client] Status:', status);
-    },
+    onStatus: (status) => console.log('[client] Status:', status),
+    onEphemeral: (data) => console.log('[client] Ephemeral:', new TextDecoder().decode(data)),
   });
 
-  return {
-    provider,
-    getDoc: () => doc,
-    addItem: (text: string) => {
-      provider.change((d: any) => {
-        if (!d.items) d.items = [];
-        d.items.push({ text });
-      });
-    },
-  };
+  // Create a new document
+  const handle = provider.create<{ items: Array<{ text: string }> }>();
+
+  // Make changes
+  handle.change((doc) => {
+    doc.items = [];
+    doc.items.push({ text: 'Hello from client' });
+  });
+
+  return { provider, handle };
 }
