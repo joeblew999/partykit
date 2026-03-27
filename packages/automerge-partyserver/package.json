@@ -1,0 +1,40 @@
+{
+  "name": "automerge-partyserver",
+  "version": "0.1.0",
+  "description": "Automerge CRDT sync for PartyKit / partyserver (like y-partyserver but for Automerge)",
+  "keywords": [
+    "automerge",
+    "crdt",
+    "collaboration",
+    "partykit",
+    "partyserver",
+    "durable-objects",
+    "websocket"
+  ],
+  "license": "ISC",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/server/index.js",
+      "types": "./dist/server/index.d.ts"
+    },
+    "./provider": {
+      "import": "./dist/provider/index.js",
+      "types": "./dist/provider/index.d.ts"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "dependencies": {
+    "@automerge/automerge": "^3.0.0",
+    "partyserver": "workspace:*"
+  },
+  "devDependencies": {
+    "partysocket": "workspace:*",
+    "typescript": "^5.7.0",
+    "tsup": "^8.0.0"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch"
+  }
+}
